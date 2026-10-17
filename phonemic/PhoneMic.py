@@ -38,6 +38,7 @@ from phonemic.utils.network import get_all_lan_ips, find_free_port, find_candida
 from phonemic.utils.paths import get_res_path, is_frozen
 from phonemic.utils.i18n import I18n
 from phonemic.utils.command_processor import CommandInterceptor
+from phonemic.utils.text_corrector import TextCorrector
 from phonemic.utils.settings_manager import SettingsManager
 
 logging.basicConfig(level=logging.INFO)
@@ -286,6 +287,7 @@ def main():
 
     # 6. 事件处理
     command_interceptor = CommandInterceptor()
+    text_corrector = TextCorrector()
 
     # 上屏方式变更时，若切到「模拟键盘（实时）」，先结束可能残留的上一轮 direct 会话。
     # direct_input 是模块级单例：停在 ABANDONED 会粘住下一轮——新的一轮 update()
@@ -304,12 +306,18 @@ def main():
             if not (isinstance(payload, str) and preview_text(payload)):
                 hud.on_preview_text(payload)
         elif event_type == "send":
+            # 先按用户词典纠正，再交给命令拦截器：这样「确定」被听成「却定」时，
+            # 纠正后仍能命中用户已写好的命令；命令未命中则上屏纠正后的文本。
+            # 纠正不影响 preview：识别中的半截词匹配不上，且会干扰直接输入模式。
+            corrected, corrected_changed = text_corrector.correct(payload)
+            if corrected_changed:
+                logger.info(f"词典纠正: {payload!r} -> {corrected!r}")
             # 命中命令时先撤销 preview 阶段打出的字面文字再执行，否则「回车」
             # 这类文字会和命令的效果一起留在目标程序里
             if not command_interceptor.process_send_text(
-                payload, before_execute=discard_preview
+                corrected, before_execute=discard_preview
             ):
-                flash_insert(payload)
+                flash_insert(corrected)
             hud.on_preview_text("")
         elif event_type == "key":
             # 面板快捷键按钮：keys 为 "ctrl+z" / "ctrl+a, delete" 形式

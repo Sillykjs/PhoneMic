@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from phonemic.gui.settings_dialog import SettingsDialog
 from phonemic.gui.commands_dialog import CommandsDialog
+from phonemic.gui.dictionary_dialog import DictionaryDialog
 from phonemic.tunnel.mode import TunnelMode, get_mode, set_mode, effective_auth_method
 from phonemic.utils.paths import get_app_root, get_build_info, is_frozen
 from phonemic.utils.i18n import I18n
@@ -613,6 +614,11 @@ class Dashboard(QMainWindow):
         commands_action.triggered.connect(self._open_commands_dialog)
         program_menu.addAction(commands_action)
 
+        # 词典配置
+        dictionary_action = QAction(self.i18n.tr("dashboard.menu_dictionary"), self)
+        dictionary_action.triggered.connect(self._open_dictionary_dialog)
+        program_menu.addAction(dictionary_action)
+
         if not is_frozen():
             # 鼠标曲线调试（临时工具，验证帧率与位移是否抖动）
             debug_action = QAction("鼠标曲线调试", self)
@@ -724,6 +730,10 @@ class Dashboard(QMainWindow):
 
     def _open_commands_dialog(self):
         dlg = CommandsDialog(self)
+        dlg.exec_()
+
+    def _open_dictionary_dialog(self):
+        dlg = DictionaryDialog(self)
         dlg.exec_()
 
     def _on_switch_network(self):
