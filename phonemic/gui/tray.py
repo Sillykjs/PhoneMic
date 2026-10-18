@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Slot, Qt
 from phonemic.gui.dashboard import Dashboard
 from phonemic.gui.settings_dialog import SettingsDialog
 from phonemic.gui.commands_dialog import CommandsDialog
+from phonemic.gui.dictionary_dialog import DictionaryDialog
 from phonemic.utils.i18n import I18n
 from phonemic.utils.settings_manager import SettingsManager
 
@@ -135,6 +136,11 @@ class SystemTray(QObject):
         dlg = CommandsDialog(self.dashboard)
         dlg.exec()
 
+    def _open_dictionary_dialog(self):
+        # 同上：parent 必须是 QWidget，SystemTray 自己是 QObject
+        dlg = DictionaryDialog(self.dashboard)
+        dlg.exec()
+
     def _set_input_mode(self, mode: str) -> None:
         """托盘菜单切换上屏方式，立即持久化生效。"""
         if mode != self.sm.get("text_input_mode", "paste"):
@@ -163,6 +169,7 @@ class SystemTray(QObject):
         menu.addSeparator()
         menu.addAction(self.i18n.tr("tray.menu_settings")).triggered.connect(self._open_settings)
         menu.addAction(self.i18n.tr("dashboard.menu_command")).triggered.connect(self._open_commands_dialog)
+        menu.addAction(self.i18n.tr("dashboard.menu_dictionary")).triggered.connect(self._open_dictionary_dialog)
         menu.addSeparator()
 
         # 上屏方式（三选一），与主界面菜单 / 偏好设置保持一致。

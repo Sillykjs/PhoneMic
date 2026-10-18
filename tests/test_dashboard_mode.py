@@ -856,3 +856,46 @@ class TestTunnelReachabilityStatus:
         dashboard.status_label.setText("SENTINEL")
         dashboard.set_tunnel_reachability(True)  # 与初值相同，应直接返回
         assert dashboard.status_label.text() == "SENTINEL"
+
+
+class TestDictionaryMenu:
+    """「程序」菜单里的词典入口：文案存在、能打开对话框、且 parent 是主窗口。"""
+
+    @staticmethod
+    def _program_menu_labels(dashboard):
+        """返回「程序」子菜单各项的文案。
+
+        只在同一个作用域内读完整条链，且只把字符串带出去。
+        PySide6（libshiboken）里 QAction / QMenu 的包装对象一旦被回收，
+        再把 menu() 的结果传到别处就会抛 "Internal C++ object already deleted"。
+        """
+        actions = dashboard.menuBar().actions()
+        for action in actions:
+            if action.text() == dashboard.i18n.tr("dashboard.menu_program"):
+                return [item.text() for item in action.menu().actions()]
+        raise AssertionError("找不到「程序」菜单")
+
+    def test_menu_action_present(self, dashboard):
+        labels = self._program_menu_labels(dashboard)
+        assert dashboard.i18n.tr("dashboard.menu_dictionary") in labels
+
+    def test_menu_action_sits_next_to_commands(self, dashboard):
+        labels = self._program_menu_labels(dashboard)
+        assert labels.index(dashboard.i18n.tr("dashboard.menu_dictionary")) == \
+            labels.index(dashboard.i18n.tr("dashboard.menu_command")) + 1
+
+    def test_open_dictionary_dialog_passes_self(self, dashboard, mocker):
+        seen = []
+
+        class _FakeDialog:
+            def __init__(self, parent=None):
+                seen.append(parent)
+
+            def exec_(self):
+                return 0
+
+        mocker.patch("phonemic.gui.dashboard.DictionaryDialog", _FakeDialog)
+
+        dashboard._open_dictionary_dialog()
+
+        assert seen == [dashboard]

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QSystemTrayIcon, QWidget
 
 from phonemic.gui.commands_dialog import CommandsDialog
 from phonemic.gui.dashboard import Dashboard
+from phonemic.gui.dictionary_dialog import DictionaryDialog
 from phonemic.gui.settings_dialog import SettingsDialog
 from phonemic.gui.tray import SystemTray
 from phonemic.tunnel.mode import TunnelMode
@@ -45,17 +46,21 @@ def tray(qtbot, tmp_path, monkeypatch):
 
 @pytest.fixture
 def isolated_commands_dir(tmp_path, monkeypatch):
-    """把 CommandsManager 的配置目录指向 tmp_path 并复位单例。
+    """把 CommandsManager / DictionaryManager 的配置目录指向 tmp_path 并复位单例。
 
-    CommandsDialog 真实构造时会读 commands.json，不隔离就会写进真实用户配置。
+    两个对话框真实构造时会读 commands.json / dictionary.json，
+    不隔离就会写进真实用户配置。
     """
     from phonemic.utils import commands_manager as cm_mod
+    from phonemic.utils import dictionary_manager as dm_mod
     from phonemic.utils import paths as paths_mod
 
     monkeypatch.setattr(paths_mod, "_get_local_app_data", lambda: tmp_path)
     cm_mod.CommandsManager._instance = None
+    dm_mod.DictionaryManager._instance = None
     yield tmp_path
     cm_mod.CommandsManager._instance = None
+    dm_mod.DictionaryManager._instance = None
 
 
 def _item_labels(menu):
@@ -72,6 +77,7 @@ class TestTrayMenuStructure:
             None,
             i18n.tr("tray.menu_settings"),
             i18n.tr("dashboard.menu_command"),
+            i18n.tr("dashboard.menu_dictionary"),
             None,
             i18n.tr("dashboard.input_clipboard"),
             i18n.tr("dashboard.input_type"),
@@ -198,6 +204,13 @@ class TestTrayDialogEntries:
 
         assert recorded == [tray.dashboard]
 
+    def test_open_dictionary_dialog_passes_dashboard(self, tray, isolated_commands_dir, mocker):
+        recorded = self._spy_on(DictionaryDialog, mocker)
+
+        tray._open_dictionary_dialog()
+
+        assert recorded == [tray.dashboard]
+
     def test_dialog_parent_must_be_qwidget(self, tray, mocker):
         """用替身锁住类型契约：即便将来 Qt 放宽构造签名，也不该传 QObject。"""
         seen = []
@@ -210,11 +223,13 @@ class TestTrayDialogEntries:
                 return 0
 
         mocker.patch("phonemic.gui.tray.CommandsDialog", _FakeDialog)
+        mocker.patch("phonemic.gui.tray.DictionaryDialog", _FakeDialog)
         mocker.patch("phonemic.gui.tray.SettingsDialog", _FakeDialog)
 
         tray._open_commands_dialog()
+        tray._open_dictionary_dialog()
         tray._open_settings()
 
-        assert len(seen) == 2
+        assert len(seen) == 3
         for parent in seen:
             assert isinstance(parent, QWidget)
