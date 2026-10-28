@@ -546,7 +546,9 @@ def test_sodium_js_route(server_no_sc):
     assert resp.status == 200
     assert "javascript" in resp.headers.get("content-type", "")
     body = resp.read()
-    assert len(body) > 100000, f"sodium.js too small: {len(body)} bytes"
+    # 内容已由 libsodium（1.0MB）换成 noble 产物（62.8KB）：仍要求是完整库，
+    # 只是量级下降一个数量级。
+    assert len(body) > 50000, f"sodium.js too small: {len(body)} bytes"
 
 
 def test_sodium_js_gzip_route(server_no_sc):
@@ -560,7 +562,9 @@ def test_sodium_js_gzip_route(server_no_sc):
     assert resp.status == 200
     assert resp.headers.get("Content-Encoding") == "gzip"
     body = resp.read()
-    assert len(body) > 100000, f"sodium.js.gz too small: {len(body)} bytes"
+    # 预压缩的 sodium.js.gz 已删除（它会在 gzip 请求下继续发旧 libsodium）；
+    # 现在由 GZipMiddleware 实时压缩 62.8KB 的 noble 产物，约 23KB。
+    assert len(body) > 20000, f"sodium.js gzip too small: {len(body)} bytes"
 
 
 # ---------- 测试手机端日志回传（POST /{secret}/api/client-log）----------
@@ -945,34 +949,92 @@ class TestDevModeMarkInjection:
         assert api_mod._DEV_MODE_MARK not in body
 
 
+class _FakeLogRequest:
+    """伪 Request：frozen 分支会先把请求体排空再回 404（理由见 api.py），
+    所以桩必须提供 stream()——真实 Request 由 starlette 提供。"""
+
+    method = "POST"
+
+    def __init__(self):
+        self.drained = False
+
+    def stream(self):
+        async def _iter():
+            self.drained = True
+            yield b'{"entries": [[0, "info", "x"]]}'
+
+        return _iter()
+
+    async def body(self):
+        return b'{"entries": [[0, "info", "x"]]}'
+
+
+def _run_in_thread(coro):
+    """在独立线程里跑协程。
+
+    必须在独立线程：pytest-playwright 会让当前线程处于 running event loop 中，
+    直接 asyncio.run() 会抛 RuntimeError，协程永不被 await。
+    """
+    box = {}
+
+    def worker():
+        box["resp"] = asyncio.run(coro)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    return box["resp"]
+
+
+def _clear_secret_path(monkeypatch):
+    """清掉加密通道：无 secret 前缀时白名单路径才可预测（见 _normalize_path）。"""
+    monkeypatch.setattr(api_mod, "_secure_channel", None)
+
+
 class TestClientLogEndpoint:
     """手机端日志回传入口：打包版整个关掉（手机端也不会发）。"""
 
     def test_404_when_packaged(self, monkeypatch):
         monkeypatch.setattr(api_mod, "is_frozen", lambda: True)
+        req = _FakeLogRequest()
+        assert _run_in_thread(api_mod._receive_client_log(req)).status_code == 404
+        # 404 之前必须排空 body，否则 Connection: close 下客户端读不到响应
+        assert req.drained is True
 
-        class _FakeRequest:
-            """伪 Request：打包版分支会先把请求体排空再回 404（理由见 api.py），
-            所以桩必须提供 stream()——真实 Request 由 starlette 提供。"""
+    def test_dispatch_404_when_packaged(self, monkeypatch):
+        """走分发层也必须 404，不能在 _dispatch_http 里先拦成 405。
 
-            def stream(self):
-                async def _iter():
-                    yield b'{"entries": [[0, "info", "x"]]}'
+        曾经在分发处加过 `not is_frozen()` 判断：打包版这个端点变成 405，
+        而 _receive_client_log 的 frozen 分支成了生产路径不可达的死代码。
+        """
+        monkeypatch.setattr(api_mod, "is_frozen", lambda: True)
+        _clear_secret_path(monkeypatch)
+        req = _FakeLogRequest()
+        resp = _run_in_thread(api_mod._dispatch_http(req, "/api/client-log"))
+        assert resp.status_code == 404
+        assert req.drained is True
 
-                return _iter()
 
-            async def body(self):
-                return b'{"entries": [[0, "info", "x"]]}'
+class TestDebugLogRoute:
+    """debug_log.js：源码运行才下发，打包版 404（_serve_debug_log 唯一入口）。"""
 
-        # 必须在独立线程里跑：pytest-playwright 会让当前线程处于 running
-        # event loop 中，直接 asyncio.run() 会抛 RuntimeError，协程永不被 await
-        box = {}
+    def test_source_serves_file(self, monkeypatch):
+        monkeypatch.setattr(api_mod, "is_frozen", lambda: False)
+        resp = api_mod._serve_debug_log()
+        assert resp.status_code == 200
+        assert resp.media_type == "application/javascript"
 
-        def worker():
-            box["resp"] = asyncio.run(api_mod._receive_client_log(_FakeRequest()))
+    def test_frozen_404(self, monkeypatch):
+        monkeypatch.setattr(api_mod, "is_frozen", lambda: True)
+        assert api_mod._serve_debug_log().status_code == 404
 
-        thread = threading.Thread(target=worker)
-        thread.start()
-        thread.join()
+    def test_dispatch_reaches_it(self, monkeypatch):
+        """分发处必须真的调用 _serve_debug_log（否则它又是死代码）。"""
+        monkeypatch.setattr(api_mod, "is_frozen", lambda: True)
+        _clear_secret_path(monkeypatch)
 
-        assert box["resp"].status_code == 404
+        class _Req:
+            method = "GET"
+
+        resp = _run_in_thread(api_mod._dispatch_http(_Req(), "/debug_log.js"))
+        assert resp.status_code == 404

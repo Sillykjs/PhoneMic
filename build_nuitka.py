@@ -146,6 +146,10 @@ def run_nuitka(onefile: bool, version: str, commit: str):
         "--enable-plugin=pyside6",
         "--include-data-dir=./phonemic/resources=phonemic/resources",
         "--noinclude-data-files=*/test.html",
+        # 手机端日志浮层的实现只在源码运行时下发（见 api.py:_serve_mobile /
+        # _serve_debug_log）。不排除就会被打进产物 —— 「打包版没有调试日志」
+        # 得真由「文件不存在」保证，而不是只靠服务端不注入标签。
+        "--noinclude-data-files=*/debug_log.js",
         f"--include-data-files={build_info_path}=build_info.json",
         "--include-data-files=./LICENSE=LICENSE",
         "--include-data-files=./LICENSE.LGPL.txt=LICENSE.LGPL.txt",

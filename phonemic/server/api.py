@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.datastructures import MutableHeaders
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -997,10 +999,18 @@ async def _serve_messages(websocket, session) -> None:
 
 # ---------- HTTP 资源处理 ----------
 
-# 手机端「开发模式」标记的注入点（对应 mobile.html 的 <head>）。
+# 手机端「开发模式」标记的注入点（对应 mobile.html 正文里、紧邻日志空壳脚本块的
+# 那一行；**不能放 <head>** —— page.set_content() 这类场景下页面脚本执行时
+# readyState 已是 complete 而 <head> 处 body 尚未建出，日志模块的 build() 会立刻
+# 执行并因 document.body 为 null 而建不出入口按钮）。
 # 打包版整个日志通道都不启动——不接管 console、不缓冲、不转发、不建入口按钮，
 # 所以这个标记必须在**页面返回时**就定下来；等 WebSocket 的 config 帧就太晚了，
 # 那时页面脚本早已执行完。占位符缺失时客户端按 false 降级（安全的一侧）。
+#
+# 同一个占位符还承担第二件事：源码运行时在后面追加一个指向 debug_log.js 的
+# script 标签（日志浮层的实现）。打包版不追加，产物里也没有那个文件 ——
+# 「打包版没有调试日志」由**文件不存在**保证（build_nuitka.py 里有对应的
+# --noinclude-data-files=*/debug_log.js，别删）。
 _DEV_MODE_MARK = "<!--PHONEMIC_DEV_MODE-->"
 
 
@@ -1008,16 +1018,21 @@ def _serve_mobile() -> Response:
     """返回手机端聊天页面（mobile.html）。
 
     页面不含任何翻译文本，语言包由手机端自行请求 /api/lang.json 获取。
-    返回前注入开发模式标记，供页面决定是否启动日志模块。
+    返回前注入开发模式标记（页面据此决定诊断开关），源码运行时另外注入
+    日志浮层的实现 debug_log.js —— 打包版两样都不下发，页面只剩空壳接口。
     """
     html_path = get_res_path("mobile.html")
     try:
         with open(html_path, "r", encoding="utf-8") as f:
             html = f.read()
-        dev = "true" if not is_frozen() else "false"
-        html = html.replace(
-            _DEV_MODE_MARK, f"<script>window.__PHONEMIC_DEV__ = {dev};</script>"
-        )
+        frozen = is_frozen()
+        dev = "false" if frozen else "true"
+        # 非 defer：日志模块要赶在紧随其后的空壳脚本块之前接管 window.PhoneLog，
+        # 且必须早于脚本块里的 window.WS_DIAG 读取。
+        inject = f"<script>window.__PHONEMIC_DEV__ = {dev};</script>"
+        if not frozen:
+            inject += '\n<script src="debug_log.js"></script>'
+        html = html.replace(_DEV_MODE_MARK, inject)
         return HTMLResponse(content=html)
     except Exception as e:
         logger.error(f"Failed to load mobile.html: {e}")
@@ -1165,39 +1180,17 @@ def _serve_test() -> Response:
             status_code=404,
         )
 
+def _serve_debug_log() -> Response:
+    """返回 debug_log.js（手机端日志浮层的实现）。
 
-def _serve_favicon() -> Response:
-    """返回 favicon。"""
-    favicon_path = get_res_path("favicon.ico")
-    return FileResponse(favicon_path, media_type="image/x-icon")
-
-
-def _serve_sodium(request: Request) -> Response:
-    """返回 libsodium.js（浏览器端加密库），支持 gzip。"""
-    accept_encoding = request.headers.get("accept-encoding", "")
-    if "gzip" in accept_encoding:
-        gz_path = get_res_path("sodium.js.gz")
-        if os.path.exists(gz_path):
-            logger.info("Serving sodium.js.gz (gzip)")
-            return FileResponse(
-                gz_path,
-                media_type="application/javascript",
-                headers={"Content-Encoding": "gzip"},
-            )
-    logger.info("Serving sodium.js (uncompressed)")
-    sodium_path = get_res_path("sodium.js")
-    return FileResponse(sodium_path, media_type="application/javascript")
-
-
-def _serve_crypto_providers() -> Response:
-    """返回 crypto_providers.js（加密提供者类）。"""
-    path = get_res_path("crypto_providers.js")
-    return FileResponse(path, media_type="application/javascript")
-
-
-def _serve_msgpack() -> Response:
-    """返回 msgpack.min.js（浏览器端 MessagePack 编解码库）。"""
-    path = get_res_path("msgpack.min.js")
+    **只有从源码运行**时页面才会请求它（服务端在 _serve_mobile 里把占位符展开成
+    <script src="debug_log.js">）；打包版既不下发那个标签、也不把该文件打进产物
+    （build_nuitka.py 的 --noinclude-data-files=*/debug_log.js）。
+    这里再兜一道 —— 打包版直接 404，否则请求会打到不存在的文件上变成 500。
+    """
+    if is_frozen():
+        return Response(status_code=404)
+    path = get_res_path("debug_log.js")
     return FileResponse(path, media_type="application/javascript")
 
 
@@ -1247,6 +1240,10 @@ _PUBLIC_PATHS = {
     "/sodium.js",
     "/crypto_providers.js",
     "/msgpack.min.js",
+    # 手机端日志浮层的实现（debug_log.js）：**只有从源码运行时**页面才会请求它，
+    # 打包版既不下发那个 <script>、也不把该文件打进产物。白名单里留着是为了
+    # 明文开发模式（_normalize_path 的另一条分支），漏了就是静默 404。
+    "/debug_log.js",
     "/ws",
     "/api/lang.json",
     # 隧道保活探测（GET）：仅返回 {"status":"ok"}，供本机保活器周期请求，
@@ -1288,6 +1285,10 @@ async def _dispatch_http(request: Request, path: str) -> Response:
     # 判定必须放在路径校验之前：路径非法时也返回 405 而不是 404，否则
     # 「路径对不对」会从状态码差异里漏出去。这也与 POST 由路由层直接
     # 返回 405 时的既有行为保持一致（见 tests/test_dispatcher.py）。
+    #
+    # 注意这里**不判 is_frozen()**：打包版关掉日志入口是 `_receive_client_log`
+    # 自己的职责（排空 body 后回 404，与「路径不存在」一致）。若在分发层拦成
+    # 405，那个 frozen 分支就成了不可达代码，两处语义还会漂移。
     if request.method == "POST":
         if normalized == "/api/client-log":
             return await _receive_client_log(request)
@@ -1305,14 +1306,15 @@ async def _dispatch_http(request: Request, path: str) -> Response:
         return _serve_lang_json()
     if normalized == "/api/keepalive":
         return _serve_keepalive(request)
-    if normalized == "/sodium.js":
-        return _serve_sodium(request)
-    if normalized == "/crypto_providers.js":
-        return _serve_crypto_providers()
-    if normalized == "/msgpack.min.js":
-        return _serve_msgpack()
+    if normalized in ["/sodium.js", "/crypto_providers.js", "/msgpack.min.js"]:
+        return FileResponse(get_res_path(normalized[1:]), media_type="application/javascript")
+    if normalized == "/debug_log.js":
+        # 单独一条：打包版要 404（见 _serve_debug_log）。塞进上面的列表里做
+        # 条件判断，会让这个「第三道保证」函数变成没人调用的死代码。
+        return _serve_debug_log()
     if normalized == "/favicon.ico":
-        return _serve_favicon()
+        # 返回**网页用**的 favicon（小图标：只有5.7KB）。mobile.html 里已内联成 data URI，这条路由只兜底兼容老浏览器。
+        return FileResponse(get_res_path("favicon_small.ico"), media_type="image/x-icon")
     if normalized == "/test":
         return _serve_test()
     return Response(status_code=404)
@@ -1351,10 +1353,15 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_security_headers)
 
 
-app = Starlette()
-# 加密模式下入口路径含 secret_path，禁止它随 Referer 外流。
-# 必须在应用启动前注册（Starlette 启动后再 add_middleware 会抛 RuntimeError）。
-app.add_middleware(SecurityHeadersMiddleware)
+# 顺序即层级：**列表里靠前的在最外层**（Starlette 用 reversed() 逐层包裹）。
+# 所以 SecurityHeadersMiddleware 写在最前 = 保持它包在 GZip 外面 —— 与原先
+# 「构造完再 add_middleware」完全等价（那个 API 是 insert(0)，同样插到最外层）。
+app = Starlette(
+    middleware=[
+        Middleware(SecurityHeadersMiddleware),  # 外层：给所有 HTTP 响应补 Referrer-Policy
+        Middleware(GZipMiddleware, minimum_size=1000),  # 内层：单位字节
+    ]
+)
 
 
 async def root(request: Request) -> Response:
