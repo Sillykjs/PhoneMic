@@ -197,6 +197,53 @@ def test_pong_whitelisted_but_unknown_type_still_errors():
     assert frame_decode(ws.frames[0])["code"] == "malformed"
 
 
+def test_phone_ping_echoed_as_pong_with_token():
+    """手机端主动探活：服务端原样回显探针号（协议 §7 双向心跳）。
+
+    手机端靠「发出 ping 后能否收到下行帧」判定链路是否还活着 —— 半开连接上
+    onclose 永远不来，这是它唯一的感知手段。回显 t 让手机端能把这一轮的回音
+    与上一轮迟到的回音区分开（同时兼作 RTT 配对）。
+    """
+
+    async def main():
+        ws = _FakeWS()
+        ok = await api._handle_client_message(
+            ws, _FakeSession({"type": "ping", "t": 7}), b"x")
+        return ws, ok
+
+    ws, ok = _run(main())
+    assert ok is True
+    assert ws.types() == ["pong"], "ping 必须回一帧 pong，且只有这一帧"
+    assert frame_decode(ws.frames[0])["t"] == 7, "探针号必须原样回显"
+
+
+def test_phone_ping_keeps_connection_alive(monkeypatch):
+    """手机端探针同样刷新存活时间戳：持续探活时服务端不会把它判死。
+
+    与服务端自己的 ping 一样，探针帧也走「收到任意帧即续命」这条路径。
+    """
+    _fast_thresholds(monkeypatch, idle=0.05, timeout=0.15, interval=0.02)
+
+    async def main():
+        ws = _FakeWS()
+        session = _FakeSession({"type": "ping", "t": 1})
+
+        async def feeder():
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                ws.push(b"probe")
+            ws.push_disconnect(1000)
+
+        feeder_task = asyncio.create_task(feeder())
+        await api._serve_messages(ws, session)
+        await feeder_task
+        return ws
+
+    ws = _run(main())
+    assert ws.types() == ["pong"] * 10, "每帧探针都该得到一帧回音"
+    assert ws.closed is None, "持续探活期间不该被判死"
+
+
 def test_hello_whitelisted_and_echoes_token():
     """hello 认下并原样回显探活号（协议 §9）；未知类型仍回 malformed。
 

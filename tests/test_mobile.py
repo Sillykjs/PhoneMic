@@ -1852,3 +1852,224 @@ class TestLocalizedWaits:
         page.wait_for_function("() => window.__st.includes(false)", timeout=2000)
         # 断连会排上 1s 退避重连（connect 没被掐），连上后应当再收一个 true
         page.wait_for_function("() => window.__st.includes(true)", timeout=5000)
+
+
+class TestProbeLiveness:
+    """手机端主动探活（wire-protocol.md §7）：补齐半开连接这条感知盲区。
+
+    `onclose` 只在收到关闭帧、或 TCP 明确断开时才触发。电脑休眠、拔网线、切 Wi-Fi、
+    隧道被掐时 TCP 没有 FIN/RST，`isConnected` 会一直停在 True —— 界面显示「已连接」，
+    发送却静默进缓冲。这类连接只能靠「发一帧探针换一帧回音」发现。
+    """
+
+    def _backdate(self, page, ms):
+        page.evaluate("(ms) => { window.__wsClient._lastRxAt = Date.now() - ms; }", ms)
+
+    def _pings(self, page):
+        return [m for m in sent_messages(page) if m.get("type") == "ping"]
+
+    def test_sends_probe_after_downlink_silence(self, mobile_page):
+        page = mobile_page
+        self._backdate(page, 16000)
+        page.evaluate("() => window.__wsClient._probeTick()")
+        pings = self._pings(page)
+        assert len(pings) == 1, "下行静默超过阈值应发一帧探针"
+        assert isinstance(pings[0].get("t"), int), "探针必须带号，回音才能配对"
+
+    def test_no_probe_while_downlink_is_flowing(self, mobile_page):
+        """刚才还收到过帧就不探：不往健康连接上白塞控制帧。"""
+        page = mobile_page
+        page.evaluate("() => window.__wsClient._probeTick()")
+        assert self._pings(page) == []
+
+    def test_one_miss_retries_before_declaring_dead(self, mobile_page):
+        """单次超时不判死：对端可能只是短暂卡住（GUI 线程忙、导出大文件）。"""
+        page = mobile_page
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c._lastRxAt = Date.now() - 40000;
+            c._probeTick();
+            const sentFirst = c._probePending !== null;
+            c._probePending.sentAt -= 9000;
+            c._probeTick();
+            return {sentFirst, misses: c._probeMisses, connected: c.isConnected,
+                    pending: c._probePending !== null};
+        }""")
+        assert r["sentFirst"] is True
+        assert r["misses"] == 1
+        assert r["connected"] is True, "一轮无回不该判死"
+        assert r["pending"] is True, "应补发一帧探针继续等"
+
+    def test_two_misses_declare_link_lost_silently(self, mobile_page):
+        """连续两轮无回：弃用 socket 重连，但界面保持静默（用户多半正在打字）。"""
+        page = mobile_page
+        page.evaluate("() => { window.__wsClient.connect = () => {}; }")   # 掐掉真重连
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c._lastRxAt = Date.now() - 40000;
+            c._probeTick();
+            c._probePending.sentAt -= 9000;
+            c._probeTick();
+            c._probePending.sentAt -= 9000;
+            c._probeTick();
+            return {connected: c.isConnected, hasSocket: c.ws !== null,
+                    statusBar: document.getElementById('status-bar').style.display};
+        }""")
+        assert r["connected"] is False
+        assert r["hasSocket"] is False, "半开 socket 必须弃用，close() 会卡在 CLOSING"
+        assert r["statusBar"] == "none", "判死时静默：交给 3s 宽限窗口决定要不要表态"
+
+    def test_probe_reply_resets_watchdog(self, mobile_page):
+        page = mobile_page
+        page.evaluate(
+            "() => { const c = window.__wsClient;"
+            "  c._probePending = {t: 99, sentAt: Date.now() - 100, timeout: 8000};"
+            "  c._probeMisses = 1; }"
+        )
+        page.evaluate("() => window.__mockWS.triggerMessage({type: 'pong', t: 99})")
+        page.wait_for_function("() => window.__wsClient._probePending === null", timeout=1000)
+        r = page.evaluate("() => ({misses: window.__wsClient._probeMisses,"
+                          "  rtt: window.__wsClient.lastRtt()})")
+        assert r["misses"] == 0, "收到任意下行帧即续命"
+        assert r["rtt"] >= 0
+
+    def test_probe_paused_during_transfer(self, mobile_page):
+        """传输期间不探活：停等 ack 本身在刷新下行，另有传输自己的超时兜底。"""
+        page = mobile_page
+        page.evaluate("() => window.__wsClient.setProbePaused(true)")
+        self._backdate(page, 30000)
+        page.evaluate("() => window.__wsClient._probeTick()")
+        assert self._pings(page) == []
+
+    def test_resume_verifies_an_open_socket(self, mobile_page):
+        """回前台时 socket 看着还开着：必须探一帧。
+
+        老的 reconnectNow 见到 readyState === OPEN 直接 return，于是「切回来看着已连接、
+        其实发不出去」永远没有恢复路径 —— 这条用例钉住这个洞。
+        """
+        page = mobile_page
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c.resumeVerify('visible');
+            return {connected: c.isConnected, pending: c._probePending !== null};
+        }""")
+        assert r["connected"] is True, "没有确凿断连证据前不改状态"
+        assert r["pending"] is True, "开着也要探一次"
+        assert len(self._pings(page)) == 1
+
+    def test_stale_close_keeps_the_new_connections_connect_timer(self, mobile_page):
+        """旧 socket 的迟到 onclose 不能清掉**新连接**的 3s 失败计时器。
+
+        探活判死后 _linkLost 会同步建新连接并起计时器，而旧 socket 的关闭事件是后续
+        任务才到的。若在 stale 判断之前就 _clearConnectTimer()，清掉的是新连接那只，
+        新连接便失去快速失败保护，退回 OS 级 SYN 重试的几十秒挂起 —— 恰好在探活最该
+        起作用的「网络还没恢复」这一刻。
+        """
+        page = mobile_page
+        timer = page.evaluate("""() => {
+            const c = window.__wsClient;
+            const dead = c.ws;
+            c._linkLost('test');
+            c._connectTimer = 999;                 // 哨兵：代表新连接的计时器
+            dead.onclose({ code: 1006, wasClean: false });   // 迟到事件
+            return c._connectTimer;
+        }""")
+        assert timer == 999, "stale 事件不该碰新连接的计时器"
+
+    def test_probe_loss_records_diagnostics(self, mobile_page):
+        """判死后要留下自己的现场：否则弹窗（diagText）显示的是上一次断连的信息。"""
+        page = mobile_page
+        page.evaluate("() => { window.__wsClient.connect = () => {}; }")
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c._lastClose = { code: 1000, reason: 'old', clean: true, lifetime: 1,
+                             at: Date.now() - 60000, life: '' };
+            c._lastRxAt = Date.now() - 40000;
+            c._probeTick();
+            c._probePending.sentAt -= 9000;
+            c._probeTick();
+            c._probePending.sentAt -= 9000;
+            c._probeTick();
+            return {close: c._lastClose, diag: c.diagText()};
+        }""")
+        assert r["close"]["code"] == 4000, "自造码标明这是本端探针判的"
+        assert "probe" in r["close"]["reason"]
+        assert "probe" in r["diag"], "诊断串里要能看出是探活判死，而不是旧的那次断连"
+
+    def test_resume_verify_is_skipped_while_transfer_locked(self, mobile_page):
+        """传输中回前台不探活：否则这笔等待会一直挂到传输结束，再按「无回」记一次 miss。"""
+        page = mobile_page
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c.setProbePaused(true);
+            c.resumeVerify('visible');
+            return {pending: c._probePending !== null};
+        }""")
+        assert r["pending"] is False
+        assert self._pings(page) == []
+
+
+    def test_long_silence_during_transfer_does_not_declare_link_lost(self, mobile_page):
+        """传输期间下行长时间静默（PC 在写盘、ack 排队）也不能判死。
+
+        这段时间的下行只由 ack 驱动，节奏完全由对端决定；判活交给传输自己的超时，
+        探活必须彻底让路，否则会在一条健康的连接上凭空制造一次重连。
+        """
+        page = mobile_page
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            c.connect = () => {};                    // 掐掉真重连，判死会留下痕迹
+            c.setProbePaused(true);
+            c._lastRxAt = Date.now() - 60000;        // 静默一分钟
+            for (let i = 0; i < 5; i++) c._probeTick();
+            return {connected: c.isConnected, pending: c._probePending !== null,
+                    hasSocket: c.ws !== null};
+        }""")
+        assert r["connected"] is True, "传输期间不允许判死"
+        assert r["hasSocket"] is True, "传输期间不允许弃用 socket"
+        assert r["pending"] is False, "暂停期间不该留下在飞的探针"
+        assert self._pings(page) == []
+
+    def test_unlock_after_transfer_does_not_probe_immediately(self, mobile_page):
+        """传输结束不立刻探：收尾前刚到的 ack 已经证明链路活着。
+
+        解锁只解除暂停，不重置静默计时、也不主动补一帧 —— 探不探仍由「距上一帧
+        多久」决定。若解锁时顺手 _resetProbe()，就等于假装刚刚有流量，之后真断链
+        还要多等一个 PROBE_IDLE_MS 才被发现。
+        """
+        page = mobile_page
+        # 传输期间最后一帧 ack 就在刚刚：先回拨再收帧，得到「暂停过但刚续过命」的现场
+        page.evaluate("() => window.__wsClient.setProbePaused(true)")
+        self._backdate(page, 40000)
+        page.evaluate("() => window.__mockWS.triggerMessage({type: 'pong', t: 0})")
+        r = page.evaluate("""() => {
+            const c = window.__wsClient;
+            const before = c._lastRxAt;
+            c.setProbePaused(false);
+            c._probeTick();
+            return {kept: c._lastRxAt === before, silent: Date.now() - c._lastRxAt,
+                    connected: c.isConnected};
+        }""")
+        assert r["connected"] is True
+        assert r["kept"] is True, "解锁不该刷新静默计时（等于假装刚有流量）"
+        assert r["silent"] < 15000, "刚收到帧，静默阈值都没到"
+        assert self._pings(page) == [], "刚收到帧就探是白费一帧"
+
+    def test_transfer_lock_toggles_probe(self, mobile_page):
+        """传输锁必须与探活暂停成对，任一侧漏掉都是坑。
+
+        只锁不停 → 传输期间按静默判死，健康连接被重连；只停不恢复 → 探活再也不跑，
+        表面一切正常，实际又回到「看着已连接、其实发不出去」的盲区。
+        """
+        page = mobile_page
+        r = page.evaluate("""() => {
+            const fp = window._filePanel;
+            if (!fp) return null;
+            fp._setLock(true);
+            const on = window.__wsClient._probePaused;
+            fp._setLock(false);
+            return {on, off: window.__wsClient._probePaused};
+        }""")
+        assert r is not None, "文件面板未初始化，用例前提不成立"
+        assert r["on"] is True, "传输开始必须停掉探活"
+        assert r["off"] is False, "解锁后探活必须恢复"

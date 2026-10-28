@@ -862,6 +862,15 @@ async def _handle_client_message(websocket, session, raw: bytes) -> bool:
         # 后台任务串行执行——收帧循环立刻回去处理 mouse/key/preview，
         # 不再被写盘堵住。队列满时这里 await，形成背压。
         await _get_transfer_queue().enqueue(msg_type, inner, websocket)
+    elif msg_type == "ping":
+        # 手机端主动探活（wire-protocol.md §7）：原样回显 t。
+        # 服务端的 ping 是按「没收到手机消息」触发的 —— 手机持续上行（预览、摇杆、
+        # 触控板）时服务端根本不会开口，下行合法静默，手机端因此区分不了「静默」
+        # 和「断链」。探针由手机端发起，判定权才在手机手里。
+        # t 对服务端不透明（与 hello 同款），只负责让手机端把「这一轮的回音」与
+        # 「上一轮迟到的回音」区分开。
+        await _send_frame(websocket, {"type": "pong", "t": inner.get("t")})
+        logger.debug(f"Received ping (t={inner.get('t')}), pong sent")
     elif msg_type == "pong":
         # 应用层心跳应答（wire-protocol.md §7）。存活时间戳已在 _serve_messages
         # 的收帧处统一刷新，这里只需认下类型，避免落到 else 回一帧 malformed。

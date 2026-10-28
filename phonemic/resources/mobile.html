@@ -1672,6 +1672,23 @@
     // 与 connectTimeout（3s）不重叠：后者只管 WS 连接建立、onopen 时即清除。
     const AUTH_CHALLENGE_TIMEOUT_MS = 35000;
 
+    // 手机端主动探活（wire-protocol.md §7）。**为什么必须由手机发起**：服务端的 ping
+    // 是按「没收到手机消息」触发的，所以手机持续上行（语音实时预览、鼠标摇杆、触控板）
+    // 时服务端永远不开口，下行长时间合法静默 —— 若手机按「多久没收到消息就断」判定，
+    // 会把自己误判死。发一帧探针换一帧回音，才能把「静默」和「断链」分开。
+    //
+    //   PROBE_IDLE_MS     下行静默多久后发探针（有业务帧就顺延，不浪费上行流量）
+    //   PROBE_TIMEOUT_MS  单次探针等回音的时长，超时补探一次
+    //   PROBE_MAX_MISSES  连续几轮无回才判死（一次超时可能只是对端卡了一下）
+    //   PROBE_RESUME_MS   回前台/回网后单发一次的等待时长：此时 socket 多半已被系统
+    //                     掐掉，只给一轮 —— 多等一轮就是让用户对着死页面打字
+    //   PROBE_TICK_MS     检查周期
+    const PROBE_IDLE_MS = 15000;
+    const PROBE_TIMEOUT_MS = 8000;
+    const PROBE_MAX_MISSES = 2;
+    const PROBE_RESUME_MS = 5000;
+    const PROBE_TICK_MS = 1000;
+
     // WSClient 在 hub 上额外发出的两个**本地信号**（与下行帧共用一个 hub，见 1.3 节）：
     //   WS_CLOSE  —— 连接真的断了。**不受静默宽限期影响**：事务级的等待（等 ack / 等
     //                取消回执）要靠它立刻收尾，否则一次「回前台多半会自愈」的抖动会把
@@ -1701,10 +1718,21 @@
             this.authRejected = false;
             // TOFU 首次：等 auth_challenge 的计时器（PC 审批需人工介入，故远超 connectTimeout）
             this._authChallengeTimer = null;
-            this._lastClose = null;   // 最近一次 onclose 的现场（code/reason/clean/stale）
+            this._lastClose = null;   // 最近一次 onclose 的现场（code/reason/clean/lifetime）
+            this._connT0 = 0;         // 当前连接建立（connect 发出）的时刻，诊断用的连接年龄
+            // ---- 手机端主动探活状态（见 PROBE_* 常量） ----
+            this._lastRxAt = Date.now();  // 最近一次收到任意下行帧的时刻（收到即续命）
+            this._probePending = null;    // 在飞的探针：{ t, sentAt, timeout }
+            this._probeMisses = 0;        // 连续无回的轮数
+            this._probeSeq = 0;           // 探针号，仅用于日志/RTT 配对
+            this._lastRttMs = 0;          // 最近一次「探针→任意下行帧」的往返，诊断用
+            this._probePaused = false;    // 文件传输期间暂停（见 setProbePaused）
+            this._probeTimer = null;
             // 下行帧分发（SignalHub：多订阅者互不覆盖，见 1.3 节）
             this.hub = new SignalHub();
             this.secure = new SecureClient();
+            // 探活循环随页面存活，判活条件全在 _probeTick 里（未认证时什么也不做）
+            this._startProbeLoop();
         }
         /**
          * 订阅下行帧。**返回注销函数**（幂等）——现有调用点都不接收返回值，
@@ -1804,6 +1832,155 @@
             return !!this._pickerAt && (Date.now() - this._pickerAt) < PICKER_CTX_MS;
         }
 
+        // ---------- 手机端主动探活（wire-protocol.md §7） ----------
+        //
+        // 补的是本类唯一感知不到的那条缝：**半开连接**。电脑休眠、拔网线、切 Wi-Fi、
+        // 隧道被掐、路由器 NAT 超时 —— 这些情况下 TCP 没有 FIN/RST，浏览器不会触发
+        // onclose，isConnected 会一直停在 true，界面照样显示「已连接」，而用户点发送
+        // 的帧只会默默进发送缓冲。原生心跳已关闭（见协议文档），没有任何东西会替我们
+        // 发现它，只能自己定期敲一下门。
+
+        /**
+         * 探活循环：1s 一跳，真正的判定条件都在 _probeTick 里。
+         * 用 setTimeout 自链而不是 setInterval：换 socket / 判死时不必担心上一跳还在飞。
+         */
+        _startProbeLoop() {
+            if (this._probeTimer) return;
+            const loop = () => {
+                this._probeTimer = setTimeout(() => {
+                    this._probeTick();
+                    loop();
+                }, PROBE_TICK_MS);
+            };
+            loop();
+        }
+
+        _probeTick() {
+            // 未认证/已判死/传输中/认证被拒：都不探
+            if (!this.isConnected || this.authRejected || this._probePaused) return;
+            // 后台的计时器会被系统节流甚至冻结：后台静默不代表断链，在这里判死必然误报。
+            // 回前台由 resumeVerify 补一次单发探针（那条路径才是后台断连的正解）。
+            if (document.visibilityState !== 'visible') return;
+            const now = Date.now();
+            if (this._probePending) {
+                if (now - this._probePending.sentAt < this._probePending.timeout) return;
+                this._probeMiss(now);
+                return;
+            }
+            if (now - this._lastRxAt < PROBE_IDLE_MS) return;
+            this._sendProbe(PROBE_TIMEOUT_MS);
+        }
+
+        /** 发一帧探针。回音（任意下行帧都算）由 onmessage 统一续命，无需专门等 pong。 */
+        _sendProbe(timeout) {
+            const t = ++this._probeSeq;
+            if (!this.sendFrame({ type: 'ping', t })) {
+                // socket 已不可写（CLOSING/CLOSED）：没必要再等回音了
+                this._linkLost('probe send failed');
+                return;
+            }
+            this._probePending = { t, sentAt: Date.now(), timeout };
+            console.debug('[WS] probe sent', `t=${t}`, `timeout=${timeout}ms`,
+                          `silent=${Date.now() - this._lastRxAt}ms`);
+        }
+
+        _probeMiss(now) {
+            this._probePending = null;
+            this._probeMisses += 1;
+            if (this._probeMisses < PROBE_MAX_MISSES) {
+                // 一次超时不判死：对端可能只是短暂卡住（GUI 线程忙、导出大文件）
+                console.debug('[WS] probe timeout, retrying',
+                              `(${this._probeMisses}/${PROBE_MAX_MISSES})`);
+                this._sendProbe(PROBE_TIMEOUT_MS);
+                return;
+            }
+            this._linkLost(`probe timeout x${this._probeMisses}, `
+                           + `no inbound for ${now - this._lastRxAt}ms`);
+        }
+
+        /** 清掉探针的在飞状态（换连接/断连时调用，避免上一轮的等待串到新连接上） */
+        _resetProbe() {
+            this._probePending = null;
+            this._probeMisses = 0;
+            this._lastRxAt = Date.now();
+        }
+
+        /**
+         * 判定链路已死：弃用当前 socket，按「静默重连」处理。
+         *
+         * **为什么不直接 ws.close()**：半开连接上 close() 只是把关闭帧塞进发送缓冲，
+         * 浏览器可能永远等不到对方的关闭应答，readyState 会长期停在 CLOSING —— 而
+         * connect() 见到 OPEN/CONNECTING 就 return，重连会被自己人堵死。所以这里
+         * 主动弃用该 socket（this.ws = null），让它迟到的 onclose 由 stale 判定吸收，
+         * 再走正常重连路径。
+         *
+         * **界面为什么不立刻表态**：此刻用户多半正在打字，弹一条「已断开」纯属打扰。
+         * 走 _startGrace 的静默宽限窗口：窗口内连上了用户全程无感，连不上才由
+         * _surfaceDisconnected 如实上报（界面停在「已连接」才是更坏的结果）。
+         */
+        _linkLost(reason) {
+            if (!this.isConnected || !this.ws) return;
+            console.warn('[WS] link lost:', reason);
+            // 诊断留档：手机端没有 console，探活判死的原因只能靠 diagText 随弹窗带出去。
+            // 4000 是自造码，标明「这条不是收到的关闭帧，而是本端探针判的」——否则
+            // 界面上会显示上一次断连的现场（或 "(no close event)"），指错方向。
+            this._lastClose = {
+                code: 4000, reason, clean: false,
+                lifetime: this._connT0 ? Date.now() - this._connT0 : 0,
+                at: Date.now(),
+                life: (window.PhoneLog && PhoneLog.snap) ? PhoneLog.snap() : '',
+            };
+            this.isConnected = false;
+            this.secure._authenticated = false;
+            this._clearConnectTimer();
+            this._resetProbe();
+            const dead = this.ws;
+            this.ws = null;
+            try { dead.close(); } catch (e) {}
+            // 与 onclose 同一套收尾：事务级信号照发（正在等 ack 的传输要立刻收尾），
+            // 界面表现交给静默宽限窗口。
+            this.hub.emit(WS_CLOSE, { code: 4000, reason });
+            this._startGrace();
+            this._skipNextDelay = true;
+            this._scheduleReconnect();
+        }
+
+        /**
+         * 页面回前台 / 网络恢复：socket 看着还在，但后台期间系统常把它掐掉而无关闭帧。
+         *
+         * 老的 reconnectNow 在这种情况下会因 readyState 仍是 OPEN 直接返回 —— 那正是
+         * 「切回来看着已连接、其实发不出去」的老洞。这里先单发一帧探针，PROBE_RESUME_MS
+         * 内没有任何回音就判死重连。
+         */
+        resumeVerify(reason) {
+            if (this.authRejected) return;
+            if (!this.isConnected || !this.isOpen()) {
+                this.reconnectNow(reason);
+                return;
+            }
+            // 传输中探活本就暂停（见 setProbePaused）：此刻再插一帧探针既违背约定，
+            // 而且 _probeTick 在暂停期间不消费它，等恢复后这笔等待会按「无回」记一次
+            // miss —— 探活没抓到真问题，倒把一条健康连接判死。传输另有超时兜底。
+            if (this._probePaused) return;
+            // 后台静默不算数：从此刻重新计时，且只给一轮（多半已经死了，别让用户干等）
+            this._resetProbe();
+            this._probeMisses = PROBE_MAX_MISSES - 1;
+            console.debug(`[WS] resume verify (${reason})`);
+            this._sendProbe(PROBE_RESUME_MS);
+        }
+
+        /**
+         * 传输期间暂停探活：停等 ack 本身在刷新下行，传输另有自己的超时兜底，
+         * 此时再往同一条有序通道塞控制帧没有收益。
+         */
+        setProbePaused(paused) {
+            this._probePaused = !!paused;
+            if (paused) this._probePending = null;
+        }
+
+        /** 最近一次探针往返（ms），仅供诊断浮层/日志使用。 */
+        lastRtt() { return this._lastRttMs; }
+
         async connect() {
             if (this.authRejected) return;
             if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
@@ -1813,10 +1990,18 @@
                 return;
             }
             const t0 = Date.now();
+            // 新连接从零开始计时：上一轮的探针/无回计数不能串到这条连接上
+            this._connT0 = t0;
+            this._resetProbe();
             this._setDebugStatus(t('dbg_connect_start'));
             this._clearConnectTimer();
             try {
                 this.ws = new WebSocket(this.url);
+                // 本次连接的对象身份：下面三个 handler 靠它分辨「这是当前连接的事件，
+                // 还是上一条已弃用 socket 的迟到事件」。**不能用 event.target**——
+                // 有些实现（含测试里的 mock）压根不给 target，那时 stale 判定会永远为假，
+                // 迟到事件就会把新连接的状态和界面污染掉。
+                const sock = this.ws;
                 // 协议走 binary 帧（msgpack），文本帧一律不予处理
                 this.ws.binaryType = 'arraybuffer';
                 this._setDebugStatus(t('dbg_handshake_wait'));
@@ -1832,6 +2017,9 @@
                 }, this.connectTimeout);
 
                 this.ws.onopen = () => {
+                    // 旧 socket 的迟到 open（已被弃用/已换连接）：它连的是另一个对象，
+                    // 在这里清计时器、发 auth 都会打到当前连接身上
+                    if (this.ws !== sock) return;
                     this._clearConnectTimer();
                     const t1 = Date.now();
                     console.info(t('log_ws_connected'), `(${t1 - t0}ms)`);
@@ -1851,6 +2039,18 @@
                     }
                 };
                 this.ws.onmessage = (event) => {
+                    // 旧 socket 的迟到帧：连接已经换过一轮，它不能再刷新新连接的任何
+                    // 状态（与 onclose 的 stale 判定同因）
+                    if (this.ws !== sock) return;
+                    // 任意下行帧都是「对端还活着」的最强证据 —— 含文件 ack、config、
+                    // 服务端自己的 ping、我们探针的回音。判活只认这一条时间戳。
+                    this._lastRxAt = Date.now();
+                    if (this._probePending) {
+                        // 探针发出后收到的第一帧：记往返时间，然后撤掉等待
+                        this._lastRttMs = this._lastRxAt - this._probePending.sentAt;
+                        this._probePending = null;
+                    }
+                    this._probeMisses = 0;
                     try {
                         const rawBytes = new Uint8Array(event.data);
 
@@ -1916,7 +2116,6 @@
                     } catch (err) { console.error(t('log_ws_parse_error'), err); }
                 };
                 this.ws.onclose = (ev) => {
-                    this._clearConnectTimer();
                     const t3 = Date.now();
                     // 关闭码是判断「谁断的、为什么断」的唯一可靠线索，必须留痕：
                     //   1000 = 服务端主动 close（如加密模式解密/seq 失步、配置变更）
@@ -1924,24 +2123,34 @@
                     //   1011 = 服务端应用层保活超时（空闲 60s 无任何消息才判死；
                     //          传输中数据帧会刷新时间戳，故上传大文件不会触发）
                     //          见 wire-protocol.md §7 ping/pong
-                    // stale=true 表示这是「旧 socket 的迟到事件」，它会污染新连接的状态
                     const code = ev && ev.code;
                     const reason = (ev && ev.reason) || '';
-                    const stale = !!(ev && ev.target && this.ws !== ev.target);
+                    const stale = this.ws !== sock;
                     // 断连当下的网络/可见性现场：1006 只能说明「没收到关闭帧」，
                     // 到底是网络断了还是页面被冻住/被回收，全靠这两个字段区分
                     const life = (window.PhoneLog && PhoneLog.snap) ? PhoneLog.snap() : '';
                     console.warn('[WS] closed', `code=${code}`, `reason=${reason || '-'}`,
                                  `clean=${ev && ev.wasClean}`, `lifetime=${t3 - t0}ms`, `stale=${stale}`,
                                  life);
+                    // stale = 旧 socket 的迟到事件（探活判死后弃用 socket、或已换过连接）。
+                    // 它既不代表当前连接断了，也不该刷新任何状态或界面 —— 当前连接自己
+                    // 的事件会负责收尾。
+                    //
+                    // **必须在这里就返回，尤其是不能碰 _connectTimer**：探活判死后
+                    // _linkLost 会同步建一条新连接并起 3s 失败计时器，而旧 socket 的
+                    // 关闭事件是**后续任务**才会到达的 —— 清了它，清掉的是新连接那只，
+                    // 新连接就失去快速失败保护，退回 OS 级 SYN 重试的几十秒挂起。
+                    if (stale) return;
+                    this._clearConnectTimer();
                     console.info(t('log_ws_disconnected'), `(${t3 - t0}ms)`);
                     // 关闭现场留档：弹窗会盖住状态栏，只有记下来才能事后带出去
                     this._lastClose = {
                         code, reason, clean: !!(ev && ev.wasClean),
-                        lifetime: t3 - t0, stale, at: t3, life,
+                        lifetime: t3 - t0, at: t3, life,
                     };
                     this.isConnected = false;
                     this.secure._authenticated = false;
+                    this._resetProbe();
                     // 连接结束：撤掉审批等待计时器与识别码浮层（下面各分支自行决定提示文案）
                     this._clearAuthChallengeTimer();
                     this._hideApprovalWait();
@@ -1979,6 +2188,9 @@
                     this._scheduleReconnect();
                 };
                 this.ws.onerror = (err) => {
+                    // 旧 socket 的迟到错误（探活判死后被弃用的那条会走这里）：
+                    // this.ws 已经不是它了，再 close 就是拿新连接开刀
+                    if (this.ws !== sock) return;
                     const t4 = Date.now();
                     console.error('WS error at', t4 - t0, 'ms:', err);
                     // 界面表现统一交给随后必然触发的 onclose（它决定静默还是如实上报），
@@ -2175,7 +2387,6 @@
             const parts = [`code=${c.code}`, `clean=${c.clean}`, `${(c.lifetime / 1000).toFixed(1)}s`,
                            `at=${clock}`];
             if (c.reason) parts.push(`reason=${c.reason}`);
-            if (c.stale) parts.push('stale');
             if (c.life) parts.push(c.life);
             return '(' + parts.join(', ') + ')';
         }
@@ -4930,6 +5141,8 @@
             // 传输期间锁死：切面板/收发文本/展开收起一律禁用并灰显
             setTransferLock: (locked) => {
                 document.body.classList.toggle('file-transferring', !!locked);
+                // 传输期间暂停探活：停等 ack 本身在刷新下行，传输另有超时兜底
+                wsClient.setProbePaused(locked);
                 ['btn-plus', 'btn-send', 'btn-clear', 'input-box'].forEach((id) => {
                     const el = document.getElementById(id);
                     if (el) el.disabled = !!locked;
@@ -4940,16 +5153,18 @@
 
         new MessageInteractionManager(chatContainer, uiController, wsClient);
 
-        // 断线恢复的两条快路径：都跳过 1s 退避直接重连（把重连窗口从「1s 起」压到「立即」）
+        // 断线恢复的两条快路径：都把重连窗口从「1s 起」压到「立即」
         //   ① network online —— Wi-Fi/蜂窝切回来
         //   ② 页面回前台 —— Android WebView 切后台（唤起文件选择器、熄屏、被别的 Activity
         //      顶掉）期间系统常顺手掐掉 socket，两端都收不到关闭帧、只剩一个 1006
+        // 注意走 resumeVerify 而不是裸 reconnectNow：这两种时刻 socket 常常**看起来还
+        // 开着**（readyState 仍是 OPEN），直接重连会被 readyState 挡住，得先探一帧。
         window.addEventListener('online', () => {
-            console.debug('[NET] Network online, triggering immediate reconnect');
-            wsClient.reconnectNow('online');
+            console.debug('[NET] Network online, verifying link');
+            wsClient.resumeVerify('online');
         });
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) wsClient.reconnectNow('visible');
+            if (!document.hidden) wsClient.resumeVerify('visible');
         });
 
         wsClient.on('config', (data) => {
@@ -4965,6 +5180,9 @@
         // 传输中数据帧本身就在刷新它的存活时间戳，因此不会打扰上传。
         // 回一帧 pong 即证明本端仍在线；sendFrame 自带断连 guard，无需额外保护。
         wsClient.on('ping', () => wsClient.sendFrame({ type: 'pong' }));
+        // 我们自己的探针回音（wire-protocol.md §7）。判定已在传输层做完——收到任意
+        // 下行帧就算续命——这里只留一行诊断，顺便让它别落进「未知类型」告警。
+        wsClient.on('pong', () => console.debug('[WS] pong', `rtt=${wsClient.lastRtt()}ms`));
         // PC 端配置变更（如切换加密开关）：URL 已变化，停止自动重连并提示重新扫码
         wsClient.on('reconnect', (data) => {
             if (data && data.reason === 'config_changed') {

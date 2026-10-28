@@ -417,6 +417,31 @@ class TestServerSendsEncrypted:
             assert pushed["test_key"] == "test_val"
 
 
+class TestPhoneProbe:
+    """手机端主动探活（wire-protocol.md §7）：整条链路走一遍加密与 msgpack。
+
+    单测只验分支（`_handle_client_message` 认出 ping 并回帧）；这里验真实帧：
+    探针加密上行 → 服务端解密认出 → 回音再加密下行 → 手机端解得回显的探针号。
+    这条链路是半开连接唯一的感知手段，断了就只剩「界面显示已连接、消息发不出去」。
+    """
+
+    def test_ping_round_trip_returns_pong_with_token(self, secure_server):
+        host, port, queue, sc = secure_server
+        phone = PhoneSimulator(sc.get_public_key_b64())
+
+        with ws_connect(ws_url(host, port, sc)) as ws:
+            phone.handshake(ws)
+            queue.get(timeout=2)
+            initial = phone.decrypt(ws.recv(timeout=3))
+            assert initial["type"] == "config"
+
+            ws.send(phone.encrypt({"type": "ping", "t": 11}))
+
+            pong = phone.decrypt(ws.recv(timeout=3))
+            assert pong["type"] == "pong"
+            assert pong["t"] == 11, "探针号必须原样回显（手机端靠它配对回音）"
+
+
 class TestStateMachineSecurity:
     """状态机安全规则测试。"""
 
