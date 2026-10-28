@@ -678,7 +678,8 @@
     // 产物 ⇒ 这里就是全部。调用方（FilePanel 的 PhoneLog.snap()、各 console 记录点）
     // 拿到空值，不报错。
     window.WS_DIAG = window.__PHONEMIC_DEV__ === true;
-    // debug_log.js 加载在先（injected in <head>），此时已经有真实现 ⇒ 不覆盖它。
+    // debug_log.js 由服务端注入在**本行上方**（非 defer，先于本脚本执行），
+    // 此时已经有真实现 ⇒ 不覆盖它。
     window.PhoneLog = window.PhoneLog || {
         push: () => {}, open: () => {}, text: () => '', snap: () => '',
     };

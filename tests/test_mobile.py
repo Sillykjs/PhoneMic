@@ -1551,8 +1551,9 @@ class TestDevModeInjection:
     """服务端注入：源码运行才下发 debug_log.js，打包版连标签都不发。
 
     这是「打包版没有调试日志」的第一道保证（第二道是产物里根本没有该文件，
-    第三道是 ``_serve_debug_log`` 在 frozen 下直接 404）。这里只钉第一道，
-    因为它最容易在改 ``_serve_mobile`` 时被无声破坏。
+    见 build_nuitka.py 的 --noinclude-data-files=*/debug_log.js；第三道是
+    ``_serve_debug_log`` 在 frozen 下直接 404，分发处真的会调用它）。这里只钉
+    第一道，因为它最容易在改 ``_serve_mobile`` 时被无声破坏。
     """
 
     def _serve(self, frozen: bool) -> str:

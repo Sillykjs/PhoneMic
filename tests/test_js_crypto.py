@@ -65,6 +65,37 @@ def crypto_page(page):
     yield page
 
 
+# ---------- 产物加载基线 ----------
+
+class TestBundleBaseline:
+    """sodium.js 的浏览器基线：老手机缺几个内置 API，也不能整包加载失败。
+
+    @noble/* v2 在**加载期**就会调用 ``Object.hasOwn``（noble-curves 构造
+    x25519 实例时校验参数），而它到 Chrome 93 / Safari 15.4 / Firefox 93 才有。
+    tools/noble-sodium/compat.ts 负责补齐；那条 import 一旦丢了，旧机型上
+    整个 bundle 抛 TypeError、``sodium`` 根本不定义，页面直接不可用。
+    """
+
+    def test_loads_without_object_hasown(self, page):
+        page.set_content("<html><body></body></html>")
+        # 模拟老浏览器：把 API 删到「没有」
+        assert page.evaluate(
+            "() => { delete Object.hasOwn; return typeof Object.hasOwn; }"
+        ) == "undefined"
+
+        page.add_script_tag(content=SODIUM_JS)
+
+        assert page.evaluate("() => typeof sodium") == "object"
+        # 补齐是持久的：同页面后续脚本（crypto_providers.js）也能用
+        assert page.evaluate("() => typeof Object.hasOwn") == "function"
+        # 真能算：sealed box = 32B 临时公钥 + 16B MAC + 1B 明文
+        assert page.evaluate(
+            "() => sodium.crypto_box_seal("
+            "  sodium.from_string('x'), sodium.crypto_box_keypair().publicKey"
+            ").length"
+        ) == 49
+
+
 # ---------- TOFU 辅助函数 ----------
 
 class TestTofuHelpers:

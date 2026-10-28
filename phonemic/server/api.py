@@ -1009,7 +1009,8 @@ async def _serve_messages(websocket, session) -> None:
 #
 # 同一个占位符还承担第二件事：源码运行时在后面追加一个指向 debug_log.js 的
 # script 标签（日志浮层的实现）。打包版不追加，产物里也没有那个文件 ——
-# 「打包版没有调试日志」由**文件不存在**保证。
+# 「打包版没有调试日志」由**文件不存在**保证（build_nuitka.py 里有对应的
+# --noinclude-data-files=*/debug_log.js，别删）。
 _DEV_MODE_MARK = "<!--PHONEMIC_DEV_MODE-->"
 
 
@@ -1183,7 +1184,8 @@ def _serve_debug_log() -> Response:
     """返回 debug_log.js（手机端日志浮层的实现）。
 
     **只有从源码运行**时页面才会请求它（服务端在 _serve_mobile 里把占位符展开成
-    <script src="debug_log.js">）；打包版既不下发那个标签、也不把该文件打进产物。
+    <script src="debug_log.js">）；打包版既不下发那个标签、也不把该文件打进产物
+    （build_nuitka.py 的 --noinclude-data-files=*/debug_log.js）。
     这里再兜一道 —— 打包版直接 404，否则请求会打到不存在的文件上变成 500。
     """
     if is_frozen():
@@ -1283,8 +1285,12 @@ async def _dispatch_http(request: Request, path: str) -> Response:
     # 判定必须放在路径校验之前：路径非法时也返回 405 而不是 404，否则
     # 「路径对不对」会从状态码差异里漏出去。这也与 POST 由路由层直接
     # 返回 405 时的既有行为保持一致（见 tests/test_dispatcher.py）。
+    #
+    # 注意这里**不判 is_frozen()**：打包版关掉日志入口是 `_receive_client_log`
+    # 自己的职责（排空 body 后回 404，与「路径不存在」一致）。若在分发层拦成
+    # 405，那个 frozen 分支就成了不可达代码，两处语义还会漂移。
     if request.method == "POST":
-        if (not is_frozen()) and normalized == "/api/client-log":
+        if normalized == "/api/client-log":
             return await _receive_client_log(request)
         # 405 是「不消费 body 就返回」的分支，必须先排空再返回，否则带 body 的 POST
         # 会以 RST 收场（原因见 _drain_request_body）。
@@ -1300,10 +1306,12 @@ async def _dispatch_http(request: Request, path: str) -> Response:
         return _serve_lang_json()
     if normalized == "/api/keepalive":
         return _serve_keepalive(request)
-    if normalized in ["/sodium.js", "/crypto_providers.js", "/msgpack.min.js", "/debug_log.js"]:
-        if is_frozen()  and normalized == "/debug_log.js":
-            return Response(status_code=404)
+    if normalized in ["/sodium.js", "/crypto_providers.js", "/msgpack.min.js"]:
         return FileResponse(get_res_path(normalized[1:]), media_type="application/javascript")
+    if normalized == "/debug_log.js":
+        # 单独一条：打包版要 404（见 _serve_debug_log）。塞进上面的列表里做
+        # 条件判断，会让这个「第三道保证」函数变成没人调用的死代码。
+        return _serve_debug_log()
     if normalized == "/favicon.ico":
         # 返回**网页用**的 favicon（小图标：只有5.7KB）。mobile.html 里已内联成 data URI，这条路由只兜底兼容老浏览器。
         return FileResponse(get_res_path("favicon_small.ico"), media_type="image/x-icon")

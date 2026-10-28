@@ -1,5 +1,5 @@
 /**
- * 构建入口 —— 本目录的唯一真源（同目录 `entry.mjs` 是早期实现，已废弃）。
+ * 构建入口 —— 本目录的唯一真源。
  *
  * 产物：phonemic/resources/sodium.js（IIFE，全局名 sodium）
  * 构建：cd tools/noble-sodium && npm ci && npm run build
@@ -22,9 +22,16 @@
  *
  * 对外名字与参数顺序严格照 libsodium.js，调用方（crypto_providers.js /
  * mobile.html）不需要任何改动。
+ *
+ * ⚠️ 浏览器基线与 libsodium.js 的 WASM 版不同：noble 是纯 JS，加载期要求
+ *    `Object.hasOwn`（Chrome 93 / Safari 15.4+），compat.ts 已补齐；补完实测
+ *    只需 BigInt 与 globalThis → Chrome 67+ / Safari 14+ / Firefox 68+。
  */
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+// ⚠️ 必须是**第一条 import**（理由见 compat.ts）：ESM 的 import 会被提升，
+// 这条晚于 noble 模块执行就失去意义，老浏览器会在加载期整包失败。
+import './compat.js';
+
 export * from '@serenity-kit/noble-sodium';
 export * from '@serenity-kit/noble-sodium/wrappers';
 
@@ -167,7 +174,13 @@ function isPaddedVariant(variant: number): boolean {
   );
 }
 
-export function to_base64(bytes: Uint8Array, variant = 0): string {
+// 默认变体与 libsodium.js 一致：base64_VARIANT_ORIGINAL（标准字母表 + padding）。
+// 不能沿用「0 = 无 padding」的自造缺省：省略参数的调用方会静默拿到另一种编码，
+// 在只有 '+' '/' 或结尾 '=' 的数据上才暴露，极难排查。
+export function to_base64(
+  bytes: Uint8Array,
+  variant = base64_VARIANT_ORIGINAL,
+): string {
   const A = isUrlSafeVariant(variant) ? B64_URL : B64_STD;
   const pad = isPaddedVariant(variant);
   let out = '';
@@ -183,7 +196,11 @@ export function to_base64(bytes: Uint8Array, variant = 0): string {
   return out;
 }
 
-export function from_base64(input: string, variant = 0): Uint8Array {
+// 默认变体同 to_base64（libsodium 的 base64_VARIANT_ORIGINAL）。
+export function from_base64(
+  input: string,
+  variant = base64_VARIANT_ORIGINAL,
+): Uint8Array {
   const A = isUrlSafeVariant(variant) ? B64_URL : B64_STD;
   const out: number[] = [];
   let bits = 0;

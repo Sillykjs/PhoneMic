@@ -1,8 +1,8 @@
 /**
  * CryptoProvider 加密算法提供者接口及具体实现。
  *
- * 依赖全局 sodium 对象（libsodium.js）与 MessagePack（msgpack.min.js），
- * 需在 sodium.ready 后使用。
+ * 依赖全局 sodium 对象（sodium.js：noble 构建的 libsodium 兼容层，见
+ * tools/noble-sodium/）与 MessagePack（msgpack.min.js），需在 sodium.ready 后使用。
  *
  * 新架构（e2ee-always-on-design.md）：
  * - 加密永远开启，不存在明文模式

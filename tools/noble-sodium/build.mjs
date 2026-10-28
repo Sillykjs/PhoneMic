@@ -13,9 +13,10 @@
  * 所以「改了版本却沿用旧 node_modules 构建」这种漂移卡在 `npm ci` 那一步，
  * 不需要脚本再校验一遍 —— 装完就一定是 lock 里那一套。
  *
- * 可复现性是硬指标：entry.ts + 下面的参数 → 与签入的 sodium.js **逐字节相同**
- * （62,625 B，sha256 30068694da50f57e…）。参数动一个就等于换了产物，务必
- * 跑 `pytest tests/test_js_crypto.py`（与 PC 端 PyNaCl 双向对拉）再签入。
+ * 可复现性是硬指标：entry.ts + compat.ts + 下面的参数 → 与签入的 sodium.js
+ * **逐字节相同**（62,809 B，sha256 6710a5ba428d14c2…）。参数动一个就等于换了
+ * 产物，务必跑 `pytest tests/test_js_crypto.py`（与 PC 端 PyNaCl 双向对拉）
+ * 再签入。
  *
  * 升级依赖：
  *   1. 改 package.json 的版本号
@@ -72,7 +73,7 @@ run(ESBUILD, [
   '--bundle',
   '--format=iife',
   '--global-name=sodium',   // 与 libsodium.js 一致，调用方无需改动
-  '--target=es2020',        // 手机端浏览器：避开 es2022 私有无障碍语法
+  '--target=es2020',        // 只降语法、不补运行时 API（Object.hasOwn 见 compat.ts）
   '--minify',
   '--legal-comments=eof',   // 保留 @noble 的 MIT 版权声明，NOTICE 里要能对上
   `--outfile=${OUT}`,
