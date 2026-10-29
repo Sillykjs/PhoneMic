@@ -532,7 +532,14 @@
             position: fixed;
             left: 12px;
             right: 12px;
-            bottom: 24px;
+            /* 垂直居中：贴底会压住输入栏（点一下气泡就重发时正好挡在手指前面），
+               贴顶会压住断线/加载状态栏，而文件发送失败那条诊断浮层恰恰只在
+               断线时出现——盖住状态栏等于把最该看的那句话藏起来。
+               聊天区内容贴着底部排，屏幕中间通常没有别的东西可挡。
+               页面 meta 带 interactive-widget=resizes-content，键盘弹起时布局
+               视口一起缩，居中的浮层不会藏到键盘底下。 */
+            top: 50%;
+            transform: translateY(-50%);
             z-index: 9998;
             display: flex;
             flex-direction: column;
@@ -2430,9 +2437,12 @@
                 // 图片气泡（photo）：到电脑剪贴板的结果展示，不参与重发
                 if (msg.dataset.kind === 'photo') return;
                 if (!this.wsClient.getConnected()) return;
-                showConfirm(t('confirm_resend')).then((ok) => {
-                    if (ok) this.ui.sendExternalMessage(msg.textContent);
-                });
+                // 点击即重发：文字气泡不再二次确认（文件气泡仍走 showConfirm，
+                // 因为重传文件有流量代价）。误触的代价只是多上屏一条同样的文字，
+                // 比每次多点一次「确定」更省事；文字重发是本地投递、PC 端不回执，
+                // 所以补一个 toast 当可见回执，否则短按完全没有反馈。
+                this.ui.sendExternalMessage(msg.textContent);
+                showToast(t('toast_resent'), '', 1500);
             });
         }
         _onStart(e) {

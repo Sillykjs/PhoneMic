@@ -183,6 +183,7 @@
     "status_load_failed_text": "Crypto library failed to load, please refresh the page",
     "confirm_resend": "Resend this message?",
     "confirm_resend_file": "Resend this file?",
+    "toast_resent": "Resent",
     "dialog_ok": "OK",
     "dialog_cancel": "Cancel",
     "log_ws_connected": "[WS] Connected",

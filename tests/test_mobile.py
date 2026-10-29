@@ -517,40 +517,52 @@ class TestChatList:
         assert mobile_page.locator("#btn-plus").is_hidden()
 
     def test_click_message_resend(self, mobile_page):
+        """短按气泡直接重发：不再有二次确认，只给一个非阻塞 toast 当回执。"""
+        dialogs = []
+        mobile_page.on("dialog", lambda d: (dialogs.append(d.message), d.dismiss()))
+
         mobile_page.locator("#mode-toggle").click()
         mobile_page.locator("#input-box").fill("resend me")
         mobile_page.locator("#btn-send").click()
 
         mobile_page.locator(".message").first.click()
-        # 确认框是自绘的（不用原生 confirm —— 微信反复弹框后会把「取消」改写成「关闭网页」）
-        assert mobile_page.inner_text("#dialog-host .dialog-title") == MOBILE_I18N["confirm_resend"]
-        mobile_page.locator("#dialog-host .dialog-btn.primary").click()
 
         msgs = [m for m in sent_messages(mobile_page) if m["type"] == "send"]
         assert len(msgs) == 2
         assert msgs[1]["text"] == "resend me"
+        # 文字气泡现在连自绘确认框都不弹：一按即发
+        assert mobile_page.evaluate(
+            "document.querySelectorAll('#dialog-host.visible').length"
+        ) == 0
+        assert dialogs == [], dialogs
+        # 没有确认框就得有别的可见回执，否则短按完全没反馈
+        toast = mobile_page.locator("#toast-host .toast")
+        assert toast.count() == 1
+        assert MOBILE_I18N["toast_resent"] in toast.inner_text()
+        # 浮层不得压住输入栏：最初提的就是「提示挡在打字的地方」
+        toast_box = toast.bounding_box()
+        bar_box = mobile_page.locator("#bottom-bar").bounding_box()
+        assert toast_box["y"] + toast_box["height"] <= bar_box["y"]
 
-    def test_click_message_cancel_does_not_resend(self, mobile_page):
-        """点「取消」不发，并且浮层自己收掉（不留半开的空框）。"""
+    def test_confirm_cancel_returns_false(self, mobile_page):
+        """文件重发仍走自绘确认框：点「取消」→ 解析为 false，浮层自己收掉。
+
+        文字气泡已经不弹框了，showConfirm 只剩文件重发这条路径在用。
+        """
         page = mobile_page
-        page.locator("#mode-toggle").click()
-        page.locator("#input-box").fill("cancel me")
-        page.locator("#btn-send").click()
-        before = len([m for m in sent_messages(page) if m["type"] == "send"])
-
-        page.locator(".message").first.click()
+        page.evaluate("() => { window.__p = showConfirm('cancel me'); }")
         cancel_btn = "#dialog-host .dialog-btn:not(.primary)"
         assert page.inner_text(cancel_btn) == MOBILE_I18N["dialog_cancel"]
         page.locator(cancel_btn).click()
 
+        assert page.evaluate("() => window.__p") is False
         assert page.evaluate("document.querySelectorAll('#dialog-host.visible').length") == 0
-        assert len([m for m in sent_messages(page) if m["type"] == "send"]) == before
 
-    def test_resend_never_opens_native_dialog(self, mobile_page):
-        """连续重发多次都不许出现原生弹窗。
+    def test_resend_never_opens_any_dialog(self, mobile_page):
+        """连点三次重发都不出现确认框（原生或自绘）。
 
-        这正是微信防骚扰策略的触发条件：原生 confirm 短时间内被反复调用后，
-        它会把「取消」改写成「关闭网页」。自绘浮层不经过这条路径。
+        微信浏览器的防骚扰策略会在反复弹原生 confirm 之后把「取消」改写成
+        「关闭网页」；文字气泡干脆不弹框，这条路径就彻底不存在了。
         """
         page = mobile_page
         dialogs = []
@@ -561,24 +573,19 @@ class TestChatList:
 
         for _ in range(3):
             page.locator(".message").first.click()
-            page.locator("#dialog-host .dialog-btn.primary").click()
 
         assert dialogs == [], dialogs
+        assert page.evaluate("document.querySelectorAll('#dialog-host.visible').length") == 0
         msgs = [m for m in sent_messages(page) if m["type"] == "send"]
-        assert len(msgs) == 4          # 首发 1 + 三次确认重发
+        assert len(msgs) == 4          # 首发 1 + 三次点击重发
 
     def test_confirm_backdrop_click_cancels(self, mobile_page):
         """点浮层背景 = 取消（手指抖出去的那一下不该被算成「确定」）。"""
         page = mobile_page
-        page.locator("#mode-toggle").click()
-        page.locator("#input-box").fill("backdrop")
-        page.locator("#btn-send").click()
-        before = len([m for m in sent_messages(page) if m["type"] == "send"])
-
-        page.locator(".message").first.click()
+        page.evaluate("() => { window.__p = showConfirm('backdrop'); }")
         page.locator("#dialog-host").click(position={"x": 5, "y": 5})   # 卡片之外
         assert page.evaluate("document.querySelectorAll('#dialog-host.visible').length") == 0
-        assert len([m for m in sent_messages(page) if m["type"] == "send"]) == before
+        assert page.evaluate("() => window.__p") is False
 
     def test_only_one_confirm_dialog_at_a_time(self, mobile_page):
         """重复调用不许叠出两个框：新的直接把旧的按「取消」收掉。
