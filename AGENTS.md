@@ -2,7 +2,7 @@
 
 > 给 AI 编码代理与贡献者的工作指南。**先读完本文件再动手。**
 > 用户文档见 [README.md](README.md)、[USER_GUIDE.md](USER_GUIDE.md)；设计细节见 [docs/](docs/)。
-> 基线：v0.6.1，HEAD `740e058`（2026-10）。命令均已在本机实测；与代码冲突时以代码为准。
+> 基线：上游 `main` HEAD `9cecf5e`（2026-10，v0.6.1 之后的 9 个提交）。命令均已在本机实测；与代码冲突时以代码为准。
 
 ## 0. 项目是什么
 
@@ -62,8 +62,8 @@ PhoneMic 让**手机浏览器**成为电脑的麦克风 / 键盘 / 鼠标 / 文�
 
 ## 2. 测试
 
-- 规模：**40 个测试文件、1053 条用例**；逐文件跑合计约 **3.5–4 分钟**（单进程、无 xdist；单次全量未实测）。改动后跑相关子集，收尾跑全量。
-- 当前基线：**1052 passed / 1 failed**。唯一失败是 `tests/test_command_processor.py::test_execute_command_with_cwd_custom_cwd`：它断言 `D:\temp`，而 `Path.resolve()` 在存在 `D:\Temp` 目录的机器上返回 `D:\Temp`。这是**环境相关**的既有失败，不要为它改生产代码，也不要用它判断自己的改动。
+- 规模：**40 个测试文件、1080 条用例**；全量单次约 **2 分 45 秒**（单进程、无 xdist）。改动后跑相关子集，收尾跑全量。
+- 当前基线：**1079 passed / 1 failed**。唯一稳定失败是 `tests/test_command_processor.py::test_execute_command_with_cwd_custom_cwd`：它断言 `D:\temp`，而 `Path.resolve()` 在存在 `D:\Temp` 目录的机器上返回 `D:\Temp`。这是**环境相关**的既有失败，不要为它改生产代码，也不要用它判断自己的改动。机器繁忙时 `tests/test_transfer.py::test_full_file_transfer_roundtrip`（依赖 0.05 秒 sleep）可能偶发失败，单跑通过即视为负载问题。
 - Qt 测试一律跑 **offscreen**：`tests/conftest.py` 在导入 Qt 前 `setdefault("QT_QPA_PLATFORM", "offscreen")`。**不要改成 `windows`**（会真的弹窗）。
 - 端口：测试用 `conftest.get_test_port()`，从 **20000** 起逐个 bind 探测；应用本身从 **12000** 起找空闲端口。禁止硬编码固定端口（Windows 动态端口池是 1024–14999，全量跑会撞 `WinError 10048`）。
 - 协议/加密测试用 `conftest.PhoneSimulator`（PyNaCl 模拟手机端握手），不要自己糊一套。
@@ -248,6 +248,7 @@ Qt 主线程 on_backend_event
 
 ## 11. 基线快照（2026-10，写本文件时）
 
-- `feature/text-dictionary`，HEAD `740e058`，v0.6.1。
-- 工作区有**预期内的本地改动**：未跟踪的 `launch.pyw`（ICU 修复启动器）与已修改的 `make_windows_lnk.ps1`（快捷方式改指 `launch.pyw`、名字改为 `PhoneMic.lnk`）。README 尚未同步这两处——不要当成待清理垃圾回滚。
-- 测试基线：1053 collected / 1052 passed / 1 已知环境相关失败（见 §2）。
+- 上游 `main` HEAD `9cecf5e`；本地开发分支 `personal/local-tweaks` 在它之上叠了几个本地提交：手机端短按气泡直发、`launch.pyw` ICU 启动修复、本基线的更新。**这条分支不推上游**（个人的本地改动，PR 已合并的部分不需要再提）。
+- `launch.pyw` 与 `make_windows_lnk.ps1`（快捷方式改指 `launch.pyw`、名字 `PhoneMic.lnk`）已入库；README / `USER_GUIDE.md` 尚未同步这两处。
+- 手机端确认框已是**自绘** `showConfirm()`（`#dialog-host`，非原生 `confirm`）。微信浏览器会反复改写原生框的「取消」按钮，所以新增交互不要再用原生 `confirm`/`alert`；文字气泡重发干脆不弹框，只给 `showToast` 回执。
+- 测试基线：见 §2（1080 collected / 1079 passed / 1 已知环境相关失败）。
